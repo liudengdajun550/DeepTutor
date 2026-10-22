@@ -18,9 +18,9 @@ from collections.abc import Sequence
 import logging
 import os
 
-from deeptutor.core.i18n import t
 from deeptutor.services.cli_apps.paths import abi_stamp, bin_dir, executable_path, runtime_dir
 from deeptutor.services.cli_apps.state import InstalledApp
+from deeptutor.services.i18n import t
 from deeptutor.services.sandbox.spec import ExecRequest, ExecResult, Mount, ResourceLimits
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,7 @@ async def run_app(
     user_id: str,
     workdir: str = "",
     mounts: tuple[Mount, ...] = (),
+    env: dict[str, str] | None = None,
     timeout_s: int | None = None,
 ) -> ExecResult:
     """Invoke *app* with *args*, returning the sandbox's result.
@@ -80,7 +81,7 @@ async def run_app(
         # it or the executable is not there at all; the sidecar already has it
         # from the compose layout and ignores the duplicate.
         mounts=(*mounts, Mount(host_path=str(app_root), sandbox_path=str(app_root))),
-        env=_env_for(app),
+        env={**_env_for(app), **(env or {})},
         limits=limits,
     )
     from deeptutor.services.sandbox import get_sandbox_service
@@ -113,7 +114,7 @@ def _env_for(app: InstalledApp) -> dict[str, str]:
     """
     return {
         "PATH": _path_for(app),
-        "HOME": "/tmp",  # noqa: S108 - tmpfs inside the sandbox, not a host path
+        "HOME": "/tmp",  # noqa: S108  # nosec B108 - tmpfs inside the sandbox, not a host path
         "LANG": "C.UTF-8",
         "PYTHONUNBUFFERED": "1",
         "PYTHONDONTWRITEBYTECODE": "1",

@@ -1,10 +1,10 @@
 "use client";
 
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, m as motion } from "framer-motion";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { getModeBadgeLabel } from "@/components/chat/home/ChatMessages";
+import { getModeBadgeLabel } from "@/features/chat/messages";
 import type { ChatOutlineEntry } from "@/lib/chat-outline";
 
 /**
@@ -227,28 +227,21 @@ export function TurnNavigator({
   // mid-transition when the hover fires, so a ``getBoundingClientRect``
   // here would anchor to the collapsed layout and then look misplaced.
   // Clamped so the card can never hang off the ends of a long rail.
-  const parkCardAt = useCallback(
-    (index: number, count: number) => {
-      const row = rowHeight(count, true);
-      const trackHeight = Math.min(
-        count * row + TRACK_PAD_PX * 2,
-        (typeof window === "undefined" ? 800 : window.innerHeight) *
-          TRACK_MAX_VH,
-      );
-      const raw =
-        TRACK_PAD_PX +
-        index * row +
-        row / 2 -
-        (trackRef.current?.scrollTop ?? 0);
-      setCardY(
-        Math.min(
-          Math.max(raw, CARD_HALF_PX),
-          Math.max(trackHeight - CARD_HALF_PX, CARD_HALF_PX),
-        ),
-      );
-    },
-    [],
-  );
+  const parkCardAt = useCallback((index: number, count: number) => {
+    const row = rowHeight(count, true);
+    const trackHeight = Math.min(
+      count * row + TRACK_PAD_PX * 2,
+      (typeof window === "undefined" ? 800 : window.innerHeight) * TRACK_MAX_VH,
+    );
+    const raw =
+      TRACK_PAD_PX + index * row + row / 2 - (trackRef.current?.scrollTop ?? 0);
+    setCardY(
+      Math.min(
+        Math.max(raw, CARD_HALF_PX),
+        Math.max(trackHeight - CARD_HALF_PX, CARD_HALF_PX),
+      ),
+    );
+  }, []);
 
   // Below three questions the rail is noise: everything is one flick away.
   if (entries.length < 3) return null;
@@ -316,13 +309,19 @@ export function TurnNavigator({
               >
                 <span
                   className={`h-[2px] rounded-full transition-[width,opacity,background-color] duration-[240ms] ease-out motion-reduce:transition-none ${
-                    isHovered
-                      ? "bg-[var(--foreground)] opacity-100"
-                      : isActive
-                        ? "bg-[var(--foreground)] opacity-80"
+                    entry.tone === "peer"
+                      ? isHovered || isActive
+                        ? "bg-[var(--primary)] opacity-100"
                         : hot
-                          ? "bg-[var(--muted-foreground)] opacity-55"
-                          : "bg-[var(--muted-foreground)] opacity-25"
+                          ? "bg-[var(--primary)] opacity-70"
+                          : "bg-[var(--primary)] opacity-40"
+                      : isHovered
+                        ? "bg-[var(--foreground)] opacity-100"
+                        : isActive
+                          ? "bg-[var(--foreground)] opacity-80"
+                          : hot
+                            ? "bg-[var(--muted-foreground)] opacity-55"
+                            : "bg-[var(--muted-foreground)] opacity-25"
                   }`}
                   style={{
                     width: tickWidth(entry.weight, hot, isActive || isHovered),
@@ -354,7 +353,17 @@ export function TurnNavigator({
                 <span className="tabular-nums">
                   {hovered.ordinal}/{entries.length}
                 </span>
-                {hovered.capability && hovered.capability !== "chat" ? (
+                {hovered.badge ? (
+                  <span
+                    className={`truncate normal-case tracking-normal ${
+                      hovered.tone === "peer"
+                        ? "text-[var(--primary)]"
+                        : "opacity-80"
+                    }`}
+                  >
+                    {hovered.badge}
+                  </span>
+                ) : hovered.capability && hovered.capability !== "chat" ? (
                   <span className="truncate normal-case tracking-normal opacity-80">
                     {t(getModeBadgeLabel(hovered.capability))}
                   </span>

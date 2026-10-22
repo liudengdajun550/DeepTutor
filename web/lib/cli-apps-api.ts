@@ -1,7 +1,7 @@
 import { apiFetch, apiUrl } from "@/lib/api";
 
 /** Mirrors `deeptutor/api/routers/space_cli_apps.py`. */
-export const CLI_APPS_BASE_PATH = "/api/v1/space/cli-apps";
+export const CLI_APPS_BASE_PATH = "/api/space/cli-apps";
 
 /** Where the code comes from — the only honest input to "should I install this?". */
 export type CliAppTrust = "first-party" | "third-party";
@@ -235,7 +235,9 @@ export async function getCliCatalog(
   const data = await asJson(response);
   const counts = (data?.categories ?? {}) as Record<string, unknown>;
   return {
-    entries: Array.isArray(data?.entries) ? data.entries.map(normalizeEntry) : [],
+    entries: Array.isArray(data?.entries)
+      ? data.entries.map(normalizeEntry)
+      : [],
     next_cursor: str(data?.next_cursor),
     total: typeof data?.total === "number" ? data.total : 0,
     categories: Object.fromEntries(
@@ -251,7 +253,9 @@ export async function getCliCatalog(
 /** Administrator only; a non-admin caller gets a 403 from the route itself. */
 export async function installCliApp(appId: string): Promise<CliAppState> {
   const response = await apiFetch(
-    apiUrl(`${CLI_APPS_BASE_PATH}/catalog/${encodeURIComponent(appId)}/install`),
+    apiUrl(
+      `${CLI_APPS_BASE_PATH}/catalog/${encodeURIComponent(appId)}/install`,
+    ),
     { method: "POST" },
   );
   return normalizeState(await asJson(response));

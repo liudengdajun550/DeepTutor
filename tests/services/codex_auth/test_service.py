@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+import httpx
 import pytest
 
 from deeptutor.services.codex_auth import service as service_module
+from deeptutor.services.codex_auth.catalog import CodexModelCatalog
 from deeptutor.services.codex_auth.contracts import (
     CatalogSnapshot,
     CodexAuthError,
@@ -22,12 +26,14 @@ from deeptutor.services.codex_auth.service import (
     MANAGED_BY,
     CodexOAuthService,
     codex_model_id,
+    parse_oauth_callback_url,
     remove_codex_catalog,
     ssh_forward_command,
     sync_codex_catalog,
 )
 from deeptutor.services.codex_auth.storage import CodexCredentialStore
 from deeptutor.services.config.model_catalog import ModelCatalogService
+from deeptutor.services.config.provider_runtime import resolve_llm_runtime_config
 
 
 def test_each_user_gets_their_own_codex_credential_root(
@@ -148,7 +154,9 @@ def test_service_singleton_reads_frontend_port_only_when_created(
         lambda _store, *, http: object(),
     )
     monkeypatch.setattr(service_module, "CodexOAuthClient", lambda _http: object())
-    monkeypatch.setattr(service_module, "get_model_catalog_service", lambda: object())
+    # A sign-in publishes into the OWNER's catalog, never the shared one that
+    # ``get_model_catalog_service`` resolves an ordinary user to (#781).
+    monkeypatch.setattr(service_module, "_owner_model_catalog_service", lambda: object())
     monkeypatch.setattr(service_module, "CodexOAuthService", CapturingService)
 
     first = service_module.get_codex_oauth_service()
@@ -164,6 +172,9 @@ def _model(
     *,
     display_name: str | None = None,
     priority: int = 1,
+    supported_reasoning_levels: tuple[str, ...] = ("medium", "high"),
+    context_window: int | None = None,
+    max_context_window: int | None = None,
 ) -> CodexModel:
     return CodexModel(
         slug=slug,
@@ -171,10 +182,12 @@ def _model(
         priority=priority,
         visibility="list",
         default_reasoning_level="medium",
-        supported_reasoning_levels=("medium", "high"),
+        supported_reasoning_levels=supported_reasoning_levels,
         supports_reasoning_summary=True,
         supports_parallel_tool_calls=True,
         use_responses_lite=False,
+        context_window=context_window,
+        max_context_window=max_context_window,
     )
 
 
@@ -244,7 +257,15 @@ def test_sync_publishes_a_read_only_owner_bound_codex_profile(tmp_path: Path) ->
 
     result = sync_codex_catalog(
         service,
-        _snapshot("live", _model("gpt-5.6-sol"), _model("gpt-5.6-terra", priority=2)),
+        _snapshot(
+            "live",
+            _model(
+                "gpt-5.6-sol",
+                context_window=272_000,
+                max_context_window=272_000,
+            ),
+            _model("gpt-5.6-terra", priority=2),
+        ),
     )
 
     profile = _managed_profile(result.catalog)
@@ -258,6 +279,40 @@ def test_sync_publishes_a_read_only_owner_bound_codex_profile(tmp_path: Path) ->
         "gpt-5.6-sol",
         "gpt-5.6-terra",
     ]
+    assert profile["models"][0]["context_window"] == "272000"
+    assert profile["models"][0]["context_window_source"] == "metadata"
+
+
+def test_sync_binds_the_managed_profile_without_storing_the_raw_account_id(
+    tmp_path: Path,
+) -> None:
+    service, _original = _seeded_service(tmp_path)
+
+    result = sync_codex_catalog(
+        service,
+        _snapshot("live", _model("gpt-5.6-sol")),
+        account_id="account-123",
+    )
+
+    profile = _managed_profile(result.catalog)
+    assert profile["codex_account_binding"] == hashlib.sha256(b"account-123").hexdigest()
+    assert "account-123" not in json.dumps(profile)
+
+
+def test_sync_uses_max_context_window_when_current_window_is_missing(tmp_path: Path) -> None:
+    service = ModelCatalogService(tmp_path / "model_catalog.json")
+
+    result = sync_codex_catalog(
+        service,
+        _snapshot(
+            "live",
+            _model("gpt-5.6-sol", max_context_window=272_000),
+        ),
+    )
+
+    model = _managed_profile(result.catalog)["models"][0]
+    assert model["context_window"] == "272000"
+    assert model["context_window_source"] == "metadata"
 
 
 def test_signing_in_never_replaces_a_model_the_operator_already_chose(
@@ -313,6 +368,118 @@ def test_refresh_replaces_only_managed_models(tmp_path: Path) -> None:
         )
         == existing_profile
     )
+
+
+def test_refresh_preserves_a_supported_reasoning_override_for_the_same_model(
+    tmp_path: Path,
+) -> None:
+    service = ModelCatalogService(tmp_path / "model_catalog.json")
+    initial = sync_codex_catalog(
+        service,
+        _snapshot("live", _model("gpt-5.6-sol"), _model("gpt-5.6-terra")),
+        account_id="account-a",
+    )
+    profile = _managed_profile(initial.catalog)
+    profile["models"][0]["reasoning_effort"] = "high"
+    service.save(initial.catalog)
+
+    refreshed = sync_codex_catalog(
+        service,
+        _snapshot("live", _model("gpt-5.6-terra"), _model("gpt-5.6-sol")),
+        account_id="account-a",
+    )
+
+    efforts = {
+        model["model"]: model.get("reasoning_effort")
+        for model in _managed_profile(refreshed.catalog)["models"]
+    }
+    assert efforts == {"gpt-5.6-terra": None, "gpt-5.6-sol": "high"}
+    assert resolve_llm_runtime_config(catalog=refreshed.catalog).reasoning_effort == "high"
+
+
+def test_account_switch_does_not_carry_a_reasoning_override(
+    tmp_path: Path,
+) -> None:
+    service = ModelCatalogService(tmp_path / "model_catalog.json")
+    initial = sync_codex_catalog(
+        service,
+        _snapshot("live", _model("gpt-5.6-sol")),
+        account_id="account-a",
+    )
+    _managed_profile(initial.catalog)["models"][0]["reasoning_effort"] = "high"
+    service.save(initial.catalog)
+
+    switched = sync_codex_catalog(
+        service,
+        _snapshot("live", _model("gpt-5.6-sol")),
+        account_id="account-b",
+    )
+
+    profile = _managed_profile(switched.catalog)
+    assert "reasoning_effort" not in profile["models"][0]
+    assert profile["codex_account_binding"] == hashlib.sha256(b"account-b").hexdigest()
+
+
+def test_refresh_drops_a_reasoning_override_the_model_no_longer_supports(
+    tmp_path: Path,
+) -> None:
+    service = ModelCatalogService(tmp_path / "model_catalog.json")
+    initial = sync_codex_catalog(service, _snapshot("live", _model("gpt-5.6-sol")))
+    profile = _managed_profile(initial.catalog)
+    profile["models"][0]["reasoning_effort"] = "high"
+    service.save(initial.catalog)
+
+    refreshed = sync_codex_catalog(
+        service,
+        _snapshot(
+            "live",
+            _model("gpt-5.6-sol", supported_reasoning_levels=("medium",)),
+        ),
+    )
+
+    model = _managed_profile(refreshed.catalog)["models"][0]
+    assert "reasoning_effort" not in model
+
+
+def test_refresh_keeps_the_canonical_profile_override_when_removing_duplicates(
+    tmp_path: Path,
+) -> None:
+    service = ModelCatalogService(tmp_path / "model_catalog.json")
+    initial = sync_codex_catalog(service, _snapshot("live", _model("gpt-5.6-sol")))
+    canonical = _managed_profile(initial.catalog)
+    canonical["models"][0]["reasoning_effort"] = "medium"
+    duplicate = deepcopy(canonical)
+    duplicate["id"] = f"{CODEX_PROFILE_ID}-duplicate"
+    duplicate["models"][0]["reasoning_effort"] = "high"
+    initial.catalog["services"]["llm"]["profiles"].append(duplicate)
+    service.save(initial.catalog)
+
+    refreshed = sync_codex_catalog(service, _snapshot("live", _model("gpt-5.6-sol")))
+
+    managed = [
+        profile
+        for profile in refreshed.catalog["services"]["llm"]["profiles"]
+        if profile.get("managed_by") == MANAGED_BY
+    ]
+    assert len(managed) == 1
+    assert managed[0]["models"][0]["reasoning_effort"] == "medium"
+
+
+def test_refresh_ignores_an_override_with_a_non_string_model_identity(
+    tmp_path: Path,
+) -> None:
+    service = ModelCatalogService(tmp_path / "model_catalog.json")
+    initial = sync_codex_catalog(service, _snapshot("live", _model("gpt-5.6-sol")))
+    stale = _managed_profile(initial.catalog)["models"][0]
+    stale["model"] = []
+    stale["reasoning_effort"] = "high"
+    service.save(initial.catalog)
+
+    refreshed = sync_codex_catalog(service, _snapshot("live", _model("gpt-5.6-sol")))
+
+    model = _managed_profile(refreshed.catalog)["models"][0]
+    assert model["model"] == "gpt-5.6-sol"
+    assert "reasoning_effort" not in model
 
 
 def test_refresh_repoints_a_selection_whose_model_left_the_account(tmp_path: Path) -> None:
@@ -418,6 +585,7 @@ class FakeOAuthClient:
         }
         self.exchange_error: CodexAuthError | None = None
         self.revoke_error: CodexAuthError | None = None
+        self.refresh_error: CodexAuthError | None = None
         self.refresh_started: asyncio.Event | None = None
         self.refresh_release: asyncio.Event | None = None
         self.refresh_calls = 0
@@ -436,6 +604,8 @@ class FakeOAuthClient:
     async def refresh(self, refresh_token: str) -> dict[str, Any]:
         del refresh_token
         self.refresh_calls += 1
+        if self.refresh_error is not None:
+            raise self.refresh_error
         if self.refresh_started is not None:
             self.refresh_started.set()
         if self.refresh_release is not None:
@@ -483,13 +653,14 @@ def _stored_credentials(
     token: str = "old",
     *,
     expires_at: int = 10_000,
+    account_id: str = "account-123",
 ) -> CodexCredentials:
     return CodexCredentials(
         schema_version=1,
         access_token=f"{token}-access",
         refresh_token=f"{token}-refresh",
         id_token=f"{token}-id",
-        account_id="account-123",
+        account_id=account_id,
         expires_at=expires_at,
         generation=0,
     )
@@ -547,6 +718,252 @@ async def _wait_until_terminal(service: CodexOAuthService) -> dict[str, Any]:
     raise AssertionError("Codex login operation did not finish")
 
 
+def _bound_reasoning_service(
+    tmp_path: Path,
+    snapshot: CatalogSnapshot,
+) -> tuple[CodexOAuthService, ModelCatalogService]:
+    model_catalog, _original = _seeded_service(tmp_path)
+    store = CodexCredentialStore(tmp_path / "secrets")
+    credentials = _stored_credentials()
+    store.commit_credentials(credentials, expected_generation=0)
+    sync_codex_catalog(
+        model_catalog,
+        snapshot,
+        account_id=credentials.account_id,
+    )
+    return (
+        CodexOAuthService(
+            store,
+            FakeCatalog(snapshot),
+            model_catalog,
+            oauth_client=FakeOAuthClient(),
+        ),
+        model_catalog,
+    )
+
+
+@pytest.mark.asyncio
+async def test_owner_sets_supported_reasoning_effort_on_their_managed_model(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot("live", _model("gpt-5.6-sol"), _model("gpt-5.6-terra"))
+    service, model_catalog = _bound_reasoning_service(tmp_path, snapshot)
+    synced = model_catalog.load()
+    llm = synced["services"]["llm"]
+    llm["active_profile_id"] = CODEX_PROFILE_ID
+    llm["active_model_id"] = codex_model_id("gpt-5.6-sol")
+    model_catalog.save(synced)
+
+    status = await service.set_reasoning_effort("gpt-5.6-sol", "high")
+
+    catalog = model_catalog.load()
+    models = _managed_profile(catalog)["models"]
+    assert models[0]["reasoning_effort"] == "high"
+    assert "reasoning_effort" not in models[1]
+    assert status["models"] == [
+        {
+            "model": "gpt-5.6-sol",
+            "name": "gpt-5.6-sol",
+            "supported_reasoning_levels": ["medium", "high"],
+            "reasoning_effort": "high",
+        },
+        {
+            "model": "gpt-5.6-terra",
+            "name": "gpt-5.6-terra",
+            "supported_reasoning_levels": ["medium", "high"],
+            "reasoning_effort": None,
+        },
+    ]
+    assert resolve_llm_runtime_config(catalog=catalog).reasoning_effort == "high"
+
+
+@pytest.mark.asyncio
+async def test_owner_persists_none_for_managed_luna(tmp_path: Path) -> None:
+    snapshot = _snapshot(
+        "live",
+        _model("gpt-5.6-luna", supported_reasoning_levels=("none", "low")),
+    )
+    service, model_catalog = _bound_reasoning_service(tmp_path, snapshot)
+    synced = model_catalog.load()
+    synced["services"]["llm"]["active_profile_id"] = CODEX_PROFILE_ID
+    synced["services"]["llm"]["active_model_id"] = codex_model_id("gpt-5.6-luna")
+    model_catalog.save(synced)
+
+    status = await service.set_reasoning_effort("gpt-5.6-luna", "none")
+
+    model = _managed_profile(model_catalog.load())["models"][0]
+    assert model["reasoning_effort"] == "none"
+    assert status["models"][0]["reasoning_effort"] == "none"
+    assert resolve_llm_runtime_config(catalog=model_catalog.load()).reasoning_effort == "none"
+
+
+@pytest.mark.asyncio
+async def test_owner_persists_none_for_managed_luna_with_legacy_profile(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(
+        "live",
+        _model("gpt-5.6-luna", supported_reasoning_levels=("none", "low")),
+    )
+    service, model_catalog = _bound_reasoning_service(tmp_path, snapshot)
+    synced = model_catalog.load()
+    synced["services"]["llm"]["active_profile_id"] = CODEX_PROFILE_ID
+    synced["services"]["llm"]["active_model_id"] = codex_model_id("gpt-5.6-luna")
+    legacy_model = _managed_profile(synced)["models"][0]
+    legacy_model["codex_supported_reasoning_levels"] = ["low"]
+    model_catalog.save(synced)
+
+    assert service.public_status()["models"][0]["supported_reasoning_levels"] == [
+        "none",
+        "low",
+    ]
+
+    status = await service.set_reasoning_effort("gpt-5.6-luna", "none")
+
+    model = _managed_profile(model_catalog.load())["models"][0]
+    assert model["codex_supported_reasoning_levels"] == ["none", "low"]
+    assert model["reasoning_effort"] == "none"
+    assert status["models"][0]["reasoning_effort"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_runtime_validation_accepts_any_effort_for_a_bound_model(tmp_path: Path) -> None:
+    """Effort is a per-request knob, not part of what binds a config to a token.
+
+    Rejecting a request whose effort differs from the stored default would fail
+    every caller that varies it for a single turn.
+    """
+    snapshot = _snapshot("live", _model("gpt-5.6-sol"))
+    service, _model_catalog = _bound_reasoning_service(tmp_path, snapshot)
+    token = await service.get_token()
+
+    for effort in ("high", "low", None):
+        service.validate_runtime_profile(token, "gpt-5.6-sol", effort)
+
+
+@pytest.mark.asyncio
+async def test_runtime_validation_rejects_a_model_outside_the_profile(tmp_path: Path) -> None:
+    snapshot = _snapshot("live", _model("gpt-5.6-sol"))
+    service, _model_catalog = _bound_reasoning_service(tmp_path, snapshot)
+    token = await service.get_token()
+
+    with pytest.raises(CodexAuthError) as exc_info:
+        service.validate_runtime_profile(token, "some-other-model", None)
+
+    assert exc_info.value.code == "codex_catalog_unavailable"
+    assert exc_info.value.http_status == 409
+
+
+@pytest.mark.asyncio
+async def test_a_profile_predating_the_account_binding_still_works(tmp_path: Path) -> None:
+    """Absent is legacy, not "someone else's".
+
+    Managed profiles published before ``codex_account_binding`` existed carry
+    no such key. Reading that as a mismatch would lock every account that
+    signed in before it shipped out of Codex entirely.
+    """
+    snapshot = _snapshot("live", _model("gpt-5.6-sol"))
+    service, model_catalog = _bound_reasoning_service(tmp_path, snapshot)
+    token = await service.get_token()
+
+    catalog = model_catalog.load()
+    _managed_profile(catalog).pop("codex_account_binding", None)
+    model_catalog.save(catalog)
+
+    service.validate_runtime_profile(token, "gpt-5.6-sol", None)
+
+
+@pytest.mark.asyncio
+async def test_a_profile_bound_to_another_account_is_still_refused(tmp_path: Path) -> None:
+    snapshot = _snapshot("live", _model("gpt-5.6-sol"))
+    service, model_catalog = _bound_reasoning_service(tmp_path, snapshot)
+    token = await service.get_token()
+
+    catalog = model_catalog.load()
+    _managed_profile(catalog)["codex_account_binding"] = "another-account-binding"
+    model_catalog.save(catalog)
+
+    with pytest.raises(CodexAuthError) as exc_info:
+        service.validate_runtime_profile(token, "gpt-5.6-sol", None)
+
+    assert exc_info.value.http_status == 409
+
+
+def test_profile_binding_matches_only_current_credentials(tmp_path: Path) -> None:
+    snapshot = _snapshot("live", _model("gpt-5.6-sol"))
+    service, model_catalog = _bound_reasoning_service(tmp_path, snapshot)
+    profile = _managed_profile(model_catalog.load())
+    matcher = getattr(service, "profile_matches_current_account", None)
+
+    assert callable(matcher)
+    assert matcher(profile) is True
+    profile["codex_account_binding"] = "stale-account-binding"
+    assert matcher(profile) is False
+
+
+@pytest.mark.asyncio
+async def test_owner_cannot_set_an_unsupported_reasoning_effort(tmp_path: Path) -> None:
+    snapshot = _snapshot("live", _model("gpt-5.6-sol", supported_reasoning_levels=("medium",)))
+    service, model_catalog = _bound_reasoning_service(tmp_path, snapshot)
+    before = model_catalog.load()
+
+    with pytest.raises(CodexAuthError) as exc_info:
+        await service.set_reasoning_effort("gpt-5.6-sol", "high")
+
+    assert exc_info.value.code == "reasoning_effort_unsupported"
+    assert exc_info.value.http_status == 422
+    assert model_catalog.load() == before
+
+
+@pytest.mark.asyncio
+async def test_owner_can_restore_provider_default_reasoning_effort(tmp_path: Path) -> None:
+    snapshot = _snapshot("live", _model("gpt-5.6-sol"))
+    service, model_catalog = _bound_reasoning_service(tmp_path, snapshot)
+    synced = model_catalog.load()
+    _managed_profile(synced)["models"][0]["reasoning_effort"] = "high"
+    model_catalog.save(synced)
+
+    status = await service.set_reasoning_effort("gpt-5.6-sol", None)
+
+    model = _managed_profile(model_catalog.load())["models"][0]
+    assert "reasoning_effort" not in model
+    assert status["models"][0]["reasoning_effort"] is None
+
+
+@pytest.mark.asyncio
+async def test_owner_cannot_update_a_model_outside_their_managed_profile(tmp_path: Path) -> None:
+    snapshot = _snapshot("live", _model("gpt-5.6-sol"))
+    service, model_catalog = _bound_reasoning_service(tmp_path, snapshot)
+    before = model_catalog.load()
+
+    with pytest.raises(CodexAuthError) as exc_info:
+        await service.set_reasoning_effort("deepseek-ai/DeepSeek-V3", "high")
+
+    assert exc_info.value.code == "codex_model_not_found"
+    assert exc_info.value.http_status == 404
+    assert model_catalog.load() == before
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_requires_a_managed_codex_profile(tmp_path: Path) -> None:
+    model_catalog, _original = _seeded_service(tmp_path)
+    snapshot = _snapshot("live", _model("gpt-5.6-sol"))
+    service = CodexOAuthService(
+        CodexCredentialStore(tmp_path / "secrets"),
+        FakeCatalog(snapshot),
+        model_catalog,
+        oauth_client=FakeOAuthClient(),
+    )
+    before = model_catalog.load()
+
+    with pytest.raises(CodexAuthError) as exc_info:
+        await service.set_reasoning_effort("gpt-5.6-sol", "high")
+
+    assert exc_info.value.code == "codex_catalog_unavailable"
+    assert exc_info.value.http_status == 409
+    assert model_catalog.load() == before
+
+
 @pytest.mark.asyncio
 async def test_successful_live_login_keeps_the_existing_model_selection(
     tmp_path: Path,
@@ -589,6 +1006,95 @@ async def test_successful_live_login_keeps_the_existing_model_selection(
         "redirect_uri",
         "ssh_forward_command",
     }
+
+
+@pytest.mark.asyncio
+async def test_dynamic_catalog_login_and_refresh_keep_selection_and_skip_npm_on_status(
+    tmp_path: Path,
+) -> None:
+    """Login/refresh discover versions; token/status reads never do or select a new model."""
+    npm_calls = 0
+    catalog_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal npm_calls, catalog_calls
+        if request.url.host == "registry.npmjs.org":
+            npm_calls += 1
+            if npm_calls > 2:
+                return httpx.Response(503)
+            return httpx.Response(
+                200, json={"name": "@openai/codex", "version": f"1.0.{npm_calls}"}
+            )
+        catalog_calls += 1
+        assert request.url.params["client_version"] == ("1.0.1" if catalog_calls == 1 else "1.0.2")
+        if catalog_calls <= 3:
+            assert "if-none-match" not in request.headers
+        if catalog_calls == 4:
+            return httpx.Response(500)
+        if catalog_calls == 5:
+            return httpx.Response(401)
+        models = [{"slug": "chosen-model", "visibility": "list", "priority": 10}]
+        if catalog_calls >= 2:
+            models.append({"slug": "new-first-model", "visibility": "list", "priority": 0})
+        return httpx.Response(200, json={"models": models}, headers={"etag": '"catalog"'})
+
+    store = CodexCredentialStore(tmp_path / "secrets")
+    model_catalog, _ = _seeded_service(tmp_path)
+    original_selection = _selection(model_catalog.load())
+    callback = FakeCallback()
+
+    async def callback_factory(expected_state: str) -> FakeCallback:
+        callback.expected_state = expected_state
+        return callback
+
+    clock = [1_000]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        service = CodexOAuthService(
+            store,
+            CodexModelCatalog(store, http=http, version_http=http, clock=lambda: clock[0]),
+            model_catalog,
+            oauth_client=FakeOAuthClient(),
+            callback_factory=callback_factory,
+            clock=lambda: clock[0],
+        )
+        started = await service.start_login()
+        callback.complete(started["authorize_url"])
+        # Real HTTP mocks need more loop turns than the existing fake catalog.
+        for _ in range(100):
+            if service.public_status()["operation_state"] in {"completed", "failed"}:
+                break
+            await asyncio.sleep(0.01)
+        assert service.public_status()["operation_state"] == "completed"
+        assert _selection(model_catalog.load()) == original_selection
+        assert store.load_catalog_cache()["client_version"] == "1.0.1"
+
+        selected = model_catalog.load()
+        selected["services"]["llm"]["active_profile_id"] = CODEX_PROFILE_ID
+        selected["services"]["llm"]["active_model_id"] = codex_model_id("chosen-model")
+        model_catalog.save(selected)
+        await service.refresh_models()
+        assert service.public_status()["active_model"] == "chosen-model"
+        assert npm_calls == catalog_calls == 2
+
+        # A normal token renewal keeps version history but not the old ETag.
+        clock[0] = store.load_credentials().expires_at - 100
+        await service.get_token()
+        service.public_status()
+        assert npm_calls == catalog_calls == 2
+        assert store.load_catalog_cache()["client_version"] == "1.0.2"
+        await service.refresh_models()
+        assert service.public_status()["active_model"] == "chosen-model"
+        assert store.load_catalog_cache()["client_version"] == "1.0.2"
+        before = model_catalog.load()
+        with pytest.raises(CodexAuthError):
+            await service.refresh_models()
+        assert model_catalog.load() == before
+        with pytest.raises(CodexAuthError) as error:
+            await service.refresh_models()
+        assert error.value.code == "catalog_unauthorized"
+        assert service.public_status()["catalog_source"] is None
+        assert store.load_catalog_cache()["models_valid"] is False
+        assert store.load_catalog_cache()["client_version"] == "1.0.2"
 
 
 @pytest.mark.asyncio
@@ -826,6 +1332,121 @@ async def test_catalog_failure_keeps_auth_but_not_selection(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("has_previous_credentials", [True, False])
+async def test_account_switch_retires_old_catalog_before_fetching_new_models(
+    tmp_path: Path,
+    has_previous_credentials: bool,
+) -> None:
+    service, callback, oauth, catalog, store, model_catalog = await _oauth_service(tmp_path)
+    if has_previous_credentials:
+        store.commit_credentials(
+            _stored_credentials(account_id="account-a"),
+            expected_generation=0,
+        )
+    fallback_selection = _selection(model_catalog.load())
+    account_a = sync_codex_catalog(
+        model_catalog,
+        _snapshot("account-a", _model("gpt-5.6-sol")),
+        account_id="account-a",
+    ).catalog
+    profile = _managed_profile(account_a)
+    profile["models"][0]["reasoning_effort"] = "high"
+    llm = account_a["services"]["llm"]
+    llm["active_profile_id"] = profile["id"]
+    llm["active_model_id"] = profile["models"][0]["id"]
+    model_catalog.save(account_a)
+
+    oauth.exchange_payload["account_id"] = "account-b"
+    catalog.snapshot = _snapshot("account-b", _model("gpt-5.6-sol"))
+    catalog.get_started = asyncio.Event()
+    catalog.get_release = asyncio.Event()
+
+    started = await service.start_login()
+    callback.complete(started["authorize_url"])
+    await asyncio.wait_for(catalog.get_started.wait(), timeout=1)
+
+    current = store.load_credentials()
+    assert current is not None
+    assert current.account_id == "account-b"
+    during_fetch = model_catalog.load()
+    assert not any(
+        profile.get("managed_by") == MANAGED_BY
+        for profile in during_fetch["services"]["llm"]["profiles"]
+    )
+    assert _selection(during_fetch) == fallback_selection
+
+    catalog.get_release.set()
+    status = await _wait_until_terminal(service)
+    assert status["operation_state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_failed_account_switch_rejects_a_stale_reasoning_write(
+    tmp_path: Path,
+) -> None:
+    service, callback, oauth, catalog, store, model_catalog = await _oauth_service(tmp_path)
+    store.commit_credentials(
+        _stored_credentials(account_id="account-a"),
+        expected_generation=0,
+    )
+    account_a = _snapshot("account-a", _model("account-a-only"))
+    sync_codex_catalog(
+        model_catalog,
+        account_a,
+        account_id="account-a",
+    )
+    oauth.exchange_payload["account_id"] = "account-b"
+    catalog.error = CodexAuthError(
+        "catalog_unavailable",
+        "The Codex model catalog is unavailable.",
+        503,
+    )
+
+    started = await service.start_login()
+    callback.complete(started["authorize_url"])
+    status = await _wait_until_terminal(service)
+    before = model_catalog.load()
+
+    current = store.load_credentials()
+    assert current is not None
+    assert current.account_id == "account-b"
+    assert status["operation_state"] == "failed"
+    assert status["models"] == []
+    assert not any(
+        profile.get("managed_by") == MANAGED_BY for profile in before["services"]["llm"]["profiles"]
+    )
+    with pytest.raises(CodexAuthError) as exc_info:
+        await service.set_reasoning_effort("account-a-only", "high")
+    assert exc_info.value.code == "codex_catalog_unavailable"
+    assert model_catalog.load() == before
+
+
+@pytest.mark.asyncio
+async def test_unbound_managed_profile_is_hidden_and_read_only_until_refresh(
+    tmp_path: Path,
+) -> None:
+    model_catalog, _original = _seeded_service(tmp_path)
+    snapshot = _snapshot("legacy", _model("gpt-5.6-sol"))
+    sync_codex_catalog(model_catalog, snapshot)
+    store = CodexCredentialStore(tmp_path / "credentials")
+    store.commit_credentials(_stored_credentials(), expected_generation=0)
+    service = CodexOAuthService(
+        store,
+        FakeCatalog(snapshot),
+        model_catalog,
+        oauth_client=FakeOAuthClient(),
+    )
+    before = model_catalog.load()
+
+    with pytest.raises(CodexAuthError) as exc_info:
+        await service.set_reasoning_effort("gpt-5.6-sol", "high")
+
+    assert exc_info.value.code == "codex_catalog_unavailable"
+    assert service.public_status()["models"] == []
+    assert model_catalog.load() == before
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["state", "timeout", "exchange"])
 async def test_login_failures_do_not_overwrite_old_credentials(
     tmp_path: Path,
@@ -1004,6 +1625,37 @@ async def test_revoke_failure_does_not_block_local_logout_and_restore(
 
 
 @pytest.mark.asyncio
+async def test_revoke_failure_logs_warning_without_token_content(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service, _callback, oauth, _catalog, store, _model_catalog = await _oauth_service(tmp_path)
+    store.commit_credentials(_stored_credentials(), expected_generation=0)
+    oauth.revoke_error = CodexAuthError(
+        "token_revoke_failed",
+        "Codex authentication could not be revoked remotely.",
+        502,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="deeptutor.services.codex_auth.service"):
+        status = await service.logout()
+
+    assert status["connection"] == "disconnected"
+    assert store.load_credentials() is None
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "deeptutor.services.codex_auth.service"
+        and record.levelno >= logging.WARNING
+    ]
+    assert warnings, "a failed token revocation during logout must be logged"
+    rendered = "\n".join(record.getMessage() for record in warnings)
+    assert "token_revoke_failed" in rendered
+    for secret in ("old-access", "old-refresh", "old-id", "account-123"):
+        assert secret not in rendered
+
+
+@pytest.mark.asyncio
 async def test_restarted_service_restores_connection_without_operation_or_secrets(
     tmp_path: Path,
 ) -> None:
@@ -1069,3 +1721,236 @@ async def test_recover_after_unauthorized_forces_refresh_for_next_request(
 
     assert oauth.refresh_calls == 1
     assert store.load_credentials().access_token == "refreshed-access"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_get_token_stops_refreshing_after_a_failed_refresh(tmp_path: Path) -> None:
+    """A refresh the provider rejects must not be retried on every get_token
+
+    When the stored credential no longer refreshes (a revoked session, an
+    account the provider no longer authorizes), every turn used to call the
+    token endpoint again, fail again, and surface a fresh reauth each message.
+    One failure is enough to hold the auth state until a new sign-in and
+    fail fast with a clear error instead of hammering the provider per turn.
+    """
+    clock = [1_000]
+    service, _callback, oauth, _catalog, store, _models = await _oauth_service(
+        tmp_path, clock=clock
+    )
+    store.commit_credentials(
+        _stored_credentials(expires_at=1_200),
+        expected_generation=0,
+    )
+    oauth.refresh_error = CodexAuthError(
+        "token_refresh_rejected",
+        "Codex authentication could not be refreshed.",
+        401,
+    )
+
+    with pytest.raises(CodexAuthError) as first:
+        await service.get_token()
+    assert first.value.code == "token_refresh_rejected"
+    assert oauth.refresh_calls == 1
+
+    # Same conversation, next turn, still inside the cooldown: no second trip
+    # to the provider, a clear terminal error instead.
+    with pytest.raises(CodexAuthError) as second:
+        await service.get_token()
+    assert second.value.code == "authentication_required"
+    assert oauth.refresh_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_rejected_grant_stays_terminal_after_time_and_service_restart(tmp_path: Path) -> None:
+    """#1454: a revoked grant cannot become valid just because 60 seconds elapsed."""
+    clock = [1_000]
+    service, _callback, oauth, _catalog, store, _models = await _oauth_service(
+        tmp_path, clock=clock
+    )
+    store.commit_credentials(
+        _stored_credentials(expires_at=1_200),
+        expected_generation=0,
+    )
+    oauth.refresh_error = CodexAuthError("token_refresh_rejected", "boom", 401)
+
+    with pytest.raises(CodexAuthError):
+        await service.get_token()
+    assert oauth.refresh_calls == 1
+
+    clock[0] += 3600
+    oauth.refresh_error = None
+    with pytest.raises(CodexAuthError, match="Sign in to Codex again"):
+        await service.get_token()
+    assert oauth.refresh_calls == 1
+    assert service.public_status()["connection"] == "error"
+    assert service.public_status()["error_code"] == "authentication_required"
+
+    restarted, _callback, restarted_oauth, _catalog, _store, _models = await _oauth_service(
+        tmp_path, clock=clock
+    )
+    with pytest.raises(CodexAuthError, match="Sign in to Codex again"):
+        await restarted.get_token()
+    with pytest.raises(CodexAuthError, match="Sign in to Codex again"):
+        await restarted.recover_after_unauthorized(store.current_generation())
+    assert restarted_oauth.refresh_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_old_refresh_rejection_does_not_block_a_new_credential_generation(
+    tmp_path: Path,
+) -> None:
+    service, _callback, oauth, _catalog, store, _models = await _oauth_service(tmp_path)
+    old = store.commit_credentials(_stored_credentials(expires_at=20_000), expected_generation=0)
+    current = store.commit_credentials(
+        _stored_credentials(expires_at=30_000), expected_generation=old.generation
+    )
+    store.mark_authentication_rejected(old.generation)
+    assert await service.get_token() == current.public_token()
+    assert oauth.refresh_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_transient_refresh_failure_can_retry_next_turn(tmp_path: Path) -> None:
+    clock = [1_000]
+    service, _callback, oauth, _catalog, store, _models = await _oauth_service(
+        tmp_path, clock=clock
+    )
+    store.commit_credentials(_stored_credentials(expires_at=1_200), expected_generation=0)
+    oauth.refresh_error = CodexAuthError("token_refresh_failed", "Temporary failure", 502)
+
+    with pytest.raises(CodexAuthError) as failure:
+        await service.get_token()
+    assert failure.value.code == "token_refresh_failed"
+    oauth.refresh_error = None
+    token = await service.get_token()
+
+    assert oauth.refresh_calls == 2
+    assert token.access_token == "refreshed-access"
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_marks_reauth_required_until_next_login(
+    tmp_path: Path,
+) -> None:
+    """Once flagged, get_token stays terminal until a new sign-in succeeds."""
+    clock = [1_000]
+    service, _callback, oauth, _catalog, store, _models = await _oauth_service(
+        tmp_path, clock=clock
+    )
+    store.commit_credentials(
+        _stored_credentials(expires_at=1_200),
+        expected_generation=0,
+    )
+    oauth.refresh_error = CodexAuthError("token_refresh_rejected", "boom", 401)
+
+    with pytest.raises(CodexAuthError):
+        await service.get_token()
+
+    started = await service.start_login()
+    query = urlsplit(started["authorize_url"]).query
+    state = parse_qs(query)["state"][0]
+    await service.complete_login_with_callback_url(
+        f"{started['redirect_uri']}?code=authorization-code&state={state}"
+    )
+    await _wait_until_terminal(service)
+
+    oauth.refresh_error = None
+    token = await service.get_token()
+    # A successful sign-in cleared the terminal flag and replaced the
+    # credential; no refresh is triggered because the new token is fresh.
+    assert token.access_token == "new-access"
+
+
+_REDIRECT_URI = "http://localhost:1455/auth/callback"
+
+
+@pytest.mark.parametrize(
+    "pasted",
+    [
+        "http://localhost:1455/auth/callback?code=c&state=s&code=c2",
+        "http://localhost:1455/auth/callback?state=s",
+        "http://localhost:9999/auth/callback?code=c&state=s",
+        "http://evil.example/auth/callback?code=c&state=s",
+        "http://localhost:1455/somewhere-else?code=c&state=s",
+        "localhost:1455/auth/callback?code=c&state=s",
+        "not a url at all",
+    ],
+)
+def test_a_pasted_address_that_is_not_this_logins_callback_is_refused(pasted: str) -> None:
+    """The recovery form takes a string off the user's clipboard.
+
+    Anything that is not the callback this process registered — another host,
+    another port, another path, a repeated OAuth parameter, or no result at
+    all — is refused before the code reaches the exchange.
+    """
+    with pytest.raises(CodexAuthError) as exc_info:
+        parse_oauth_callback_url(pasted, _REDIRECT_URI)
+
+    assert exc_info.value.code == "callback_url_invalid"
+    assert exc_info.value.http_status == 400
+
+
+def test_a_pasted_callback_yields_its_oauth_result() -> None:
+    assert parse_oauth_callback_url(
+        f"  {_REDIRECT_URI}?code=the-code&state=the-state  ", _REDIRECT_URI
+    ) == ("the-code", "the-state", None)
+    assert parse_oauth_callback_url(f"{_REDIRECT_URI}?error=access_denied", _REDIRECT_URI) == (
+        None,
+        None,
+        "access_denied",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_docker_user_finishes_a_login_by_pasting_the_callback_address(
+    tmp_path: Path,
+) -> None:
+    """#1252: the browser reaches the callback address, the container does not.
+
+    The loopback listener runs inside the container and the standard compose
+    file does not publish its port, so the redirect dead-ends in the browser
+    and the sign-in waits until it expires. Pasting the address back finishes
+    the same exchange, with the same state check.
+    """
+    service, _callback, _oauth, _catalog, _store, _models = await _oauth_service(tmp_path)
+    started = await service.start_login()
+    state = parse_qs(urlsplit(started["authorize_url"]).query)["state"][0]
+
+    await service.complete_login_with_callback_url(
+        f"{started['redirect_uri']}?code=authorization-code&state={state}"
+    )
+
+    assert (await _wait_until_terminal(service))["operation_state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_callback_for_someone_elses_login_does_not_complete_this_one(
+    tmp_path: Path,
+) -> None:
+    """The endpoint is authenticated, so it finishes the caller's own sign-in.
+
+    A state minted for another account's login is not a credential this
+    account may spend, and the address is not fetched to find out whose it is.
+    """
+    service, _callback, _oauth, _catalog, _store, _models = await _oauth_service(tmp_path)
+    started = await service.start_login()
+
+    with pytest.raises(CodexAuthError) as exc_info:
+        await service.complete_login_with_callback_url(
+            f"{started['redirect_uri']}?code=authorization-code&state=another-accounts-state"
+        )
+
+    assert exc_info.value.code == "state_mismatch"
+    assert service.public_status()["operation_state"] == "waiting"
+    await service.cancel_login()
+
+
+@pytest.mark.asyncio
+async def test_pasting_a_callback_with_no_login_waiting_is_a_conflict(tmp_path: Path) -> None:
+    service, _callback, _oauth, _catalog, _store, _models = await _oauth_service(tmp_path)
+
+    with pytest.raises(CodexAuthError) as exc_info:
+        await service.complete_login_with_callback_url(f"{_REDIRECT_URI}?code=c&state=s")
+
+    assert exc_info.value.code == "login_not_active"
+    assert exc_info.value.http_status == 409

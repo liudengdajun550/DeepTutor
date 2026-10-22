@@ -1,5 +1,6 @@
 "use client";
 
+import Tooltip from "@/shared/ui/Tooltip";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
@@ -86,7 +87,6 @@ export default function CliAppsSection() {
   return (
     <div className="space-y-6">
       <SpaceSectionHeader
-        icon={Terminal}
         title={t("CLI Apps")}
         description={t(
           "Command-line tools from the CLI-Anything catalog. Once enabled, the chat agent can call them directly.",
@@ -275,27 +275,29 @@ function Installed({
                   />
                 )}
                 {isAdmin && (
-                  <button
-                    type="button"
-                    disabled={busy === app.id}
-                    onClick={() => {
-                      if (
-                        typeof window !== "undefined" &&
-                        !window.confirm(
-                          t('Remove "{{name}}" from this deployment?', {
-                            name: app.display_name,
-                          }),
-                        )
-                      ) {
-                        return;
-                      }
-                      void act(app.id, () => uninstallCliApp(app.id));
-                    }}
-                    title={t("Uninstall")}
-                    className="rounded-md p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-red-500 disabled:opacity-50"
-                  >
-                    <Trash2 size={14} />
-                  </button>
+                  <Tooltip label={t("Uninstall")} side="top">
+                    <button
+                      type="button"
+                      disabled={busy === app.id}
+                      onClick={() => {
+                        if (
+                          typeof window !== "undefined" &&
+                          !window.confirm(
+                            t('Remove "{{name}}" from this deployment?', {
+                              name: app.display_name,
+                            }),
+                          )
+                        ) {
+                          return;
+                        }
+                        void act(app.id, () => uninstallCliApp(app.id));
+                      }}
+                      aria-label={t("Uninstall")}
+                      className="rounded-md p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-red-500 disabled:opacity-50"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </Tooltip>
                 )}
               </div>
             </div>
@@ -398,7 +400,10 @@ function Store({
       if (queryKeyRef.current !== requestedFor) return;
       setEntries((prev) => {
         const seen = new Set(prev.map((entry) => entry.id));
-        return [...prev, ...page.entries.filter((entry) => !seen.has(entry.id))];
+        return [
+          ...prev,
+          ...page.entries.filter((entry) => !seen.has(entry.id)),
+        ];
       });
       setCursor(page.next_cursor);
     } catch (err) {
@@ -732,8 +737,8 @@ function EntryDetail({
       ) : (
         <div className="space-y-3 rounded-xl border border-[var(--border)]/60 bg-[var(--card)]/40 px-5 py-5">
           {error !== null && (
-        <Banner tone="error">{error || t("Something went wrong.")}</Banner>
-      )}
+            <Banner tone="error">{error || t("Something went wrong.")}</Banner>
+          )}
           <div className="flex flex-wrap items-center gap-3">
             <button
               type="button"
@@ -752,7 +757,9 @@ function EntryDetail({
             </button>
             <span className="text-[11.5px] text-[var(--muted-foreground)]">
               {installing
-                ? t("This can take a few minutes — it builds a fresh environment.")
+                ? t(
+                    "This can take a few minutes — it builds a fresh environment.",
+                  )
                 : t("Runs on this server as the application user.")}
             </span>
           </div>
@@ -790,13 +797,7 @@ const warnChip =
  * "should this run on our server?" — and "installs whatever that repository's
  * default branch holds today" is invisible otherwise.
  */
-function TrustChip({
-  trust,
-  pinned,
-}: {
-  trust: string;
-  pinned: boolean;
-}) {
+function TrustChip({ trust, pinned }: { trust: string; pinned: boolean }) {
   const { t } = useTranslation();
   if (trust === "first-party") {
     return (
@@ -873,8 +874,7 @@ function Banner({
 }) {
   const styles = {
     error: "border-red-500/40 bg-red-500/5 text-red-500",
-    warn:
-      "border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+    warn: "border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400",
     info: "border-[var(--border)] bg-[var(--muted)]/40 text-[var(--muted-foreground)]",
   }[tone];
   return (
@@ -908,7 +908,9 @@ function Empty({
       <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-xl bg-[var(--muted)]/60 text-[var(--muted-foreground)]">
         <Terminal size={18} />
       </div>
-      <p className="text-[14px] font-medium text-[var(--foreground)]">{title}</p>
+      <p className="text-[14px] font-medium text-[var(--foreground)]">
+        {title}
+      </p>
       <p className="mx-auto mt-1 max-w-md text-[12.5px] leading-relaxed text-[var(--muted-foreground)]">
         {body}
       </p>

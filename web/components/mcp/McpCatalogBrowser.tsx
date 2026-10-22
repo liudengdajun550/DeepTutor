@@ -1,5 +1,6 @@
 "use client";
 
+import Tooltip from "@/shared/ui/Tooltip";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
@@ -333,9 +334,7 @@ export default function McpCatalogBrowser({
                 disabled={loadingMore}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--card)] px-3 py-1.5 text-[12px] font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--muted)] disabled:opacity-60"
               >
-                {loadingMore && (
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                )}
+                {loadingMore && <Loader2 className="h-3 w-3 animate-spin" />}
                 {t("Load more")}
               </button>
             )}
@@ -363,54 +362,56 @@ function EntryCard({
   const { t } = useTranslation();
   const description = localizedCatalogText(entry.description_i18n, lang);
   return (
-    <li
-      role="button"
-      tabIndex={0}
-      onClick={onOpen}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onOpen();
-        }
-      }}
-      title={t("View details")}
-      className="group flex cursor-pointer flex-col rounded-xl border border-[var(--border)] bg-[var(--card)] p-4 shadow-sm transition-all hover:border-[var(--foreground)]/30 hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)]/40"
-    >
-      <div className="flex items-start gap-2.5">
-        <BrandIcon namespace="mcp" id={entry.id} name={entry.display_name} />
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="truncate text-[14px] font-semibold tracking-tight text-[var(--foreground)]">
-              {entry.display_name}
-            </span>
-            {installed && (
-              <span className="inline-flex shrink-0 items-center gap-1 rounded-md bg-emerald-500/12 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
-                <CheckCircle2 size={9} />
-                {t("Installed")}
+    <Tooltip label={t("View details")} as="li" side="top">
+      <div
+        role="button"
+        tabIndex={0}
+        aria-label={`${t("View details")}: ${entry.display_name}`}
+        onClick={onOpen}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onOpen();
+          }
+        }}
+        className="group flex h-full cursor-pointer flex-col rounded-xl border border-[var(--border)] bg-[var(--card)] p-4 shadow-sm transition-all hover:border-[var(--foreground)]/30 hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)]/40"
+      >
+        <div className="flex items-start gap-2.5">
+          <BrandIcon namespace="mcp" id={entry.id} name={entry.display_name} />
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="truncate text-[14px] font-semibold tracking-tight text-[var(--foreground)]">
+                {entry.display_name}
               </span>
-            )}
+              {installed && (
+                <span className="inline-flex shrink-0 items-center gap-1 rounded-md bg-emerald-500/12 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+                  <CheckCircle2 size={9} />
+                  {t("Installed")}
+                </span>
+              )}
+            </div>
+            <p className="mt-0.5 line-clamp-2 text-[12px] leading-relaxed text-[var(--muted-foreground)]">
+              {description}
+            </p>
           </div>
-          <p className="mt-0.5 line-clamp-2 text-[12px] leading-relaxed text-[var(--muted-foreground)]">
-            {description}
-          </p>
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-1.5 pt-1">
+          <span className={chipClass}>{t(`mcp.category.${entry.category}`)}</span>
+          {entry.tier === "registry" && (
+            <span className={chipClass}>{t("mcp.tier.registry")}</span>
+          )}
+          {entry.trust !== "verified" && (
+            <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10.5px] font-medium text-amber-700 dark:text-amber-400">
+              <ShieldAlert size={9} />
+              {t("Unverified")}
+            </span>
+          )}
+          {entry.fields.length > 0 && (
+            <span className={chipClass}>{t("Needs a credential")}</span>
+          )}
         </div>
       </div>
-      <div className="mt-3 flex flex-wrap items-center gap-1.5 pt-1">
-        <span className={chipClass}>{t(`mcp.category.${entry.category}`)}</span>
-        {entry.tier === "registry" && (
-          <span className={chipClass}>{t("mcp.tier.registry")}</span>
-        )}
-        {entry.trust !== "verified" && (
-          <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10.5px] font-medium text-amber-700 dark:text-amber-400">
-            <ShieldAlert size={9} />
-            {t("Unverified")}
-          </span>
-        )}
-        {entry.fields.length > 0 && (
-          <span className={chipClass}>{t("Needs a credential")}</span>
-        )}
-      </div>
-    </li>
+    </Tooltip>
   );
 }
 
@@ -505,7 +506,12 @@ function EntryDetail({
       </button>
 
       <div className="flex items-start gap-3.5">
-        <BrandIcon namespace="mcp" id={entry.id} name={entry.display_name} size="lg" />
+        <BrandIcon
+          namespace="mcp"
+          id={entry.id}
+          name={entry.display_name}
+          size="lg"
+        />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-[18px] font-semibold tracking-tight text-[var(--foreground)]">
@@ -685,7 +691,9 @@ function EntryDetail({
             // At capacity, only a write that replaces an existing server is
             // still possible — keyed on the target name, because renaming in the
             // box above turns a reinstall into a new server the store refuses.
-            disabled={installing || probing || !ready || (atCapacity && !savedConfig)}
+            disabled={
+              installing || probing || !ready || (atCapacity && !savedConfig)
+            }
             className="inline-flex items-center gap-2 rounded-lg bg-[var(--primary)] px-3.5 py-2 text-[12.5px] font-medium text-[var(--primary-foreground)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
           >
             {installing ? (
@@ -711,7 +719,6 @@ function EntryDetail({
 }
 
 // ── small parts ──────────────────────────────────────────────────────────
-
 
 function FilterChip({
   label,

@@ -16,9 +16,9 @@ import recordedEvents from "./fixtures/provider-trace-events.json";
 import {
   getLatestToolProgress,
   getToolProvider,
-} from "../components/chat/home/TracePanels";
+} from "../features/chat/trace/TracePresentation";
 import { describeProviderTool } from "../lib/trace-tools";
-import type { StreamEvent } from "../lib/unified-ws";
+import type { StreamEvent } from "../features/chat/model/protocol";
 
 const recorded = recordedEvents as unknown as Record<string, StreamEvent[]>;
 
@@ -64,10 +64,16 @@ test("every event of a recorded call carries the identity, not only the first", 
   // labelled from whatever survived.
   for (const key of ["cli", "mcp"] as const) {
     const events = recorded[key];
-    assert.ok(events.length > 1, `${key} fixture is too small to be meaningful`);
+    assert.ok(
+      events.length > 1,
+      `${key} fixture is too small to be meaningful`,
+    );
     for (let index = 0; index < events.length; index += 1) {
       const provider = getToolProvider(events.slice(index));
-      assert.ok(provider?.source, `${key}: event ${index} onwards lost the provider`);
+      assert.ok(
+        provider?.source,
+        `${key}: event ${index} onwards lost the provider`,
+      );
     }
   }
 });
@@ -92,12 +98,20 @@ test("the newest progress line wins, and non-progress events are ignored", () =>
     {
       type: "progress",
       content: "fetching pages (30%)",
-      metadata: { trace_kind: "tool_progress", tool_source: "mcp", tool_provider: "wolfram" },
+      metadata: {
+        trace_kind: "tool_progress",
+        tool_source: "mcp",
+        tool_provider: "wolfram",
+      },
     },
     {
       type: "progress",
       content: "indexing (80%)",
-      metadata: { trace_kind: "tool_progress", tool_source: "mcp", tool_provider: "wolfram" },
+      metadata: {
+        trace_kind: "tool_progress",
+        tool_source: "mcp",
+        tool_provider: "wolfram",
+      },
     },
   ] as unknown as StreamEvent[];
 
@@ -115,8 +129,13 @@ test("a call_status event is never mistaken for a progress line", () => {
   // Both are `progress` events; only `trace_kind` separates them, and
   // call_status carries an empty message that would blank the row's detail.
   const statuses = recorded.cli.filter(
-    (event) => (event.metadata as Record<string, unknown> | undefined)?.trace_kind === "call_status",
+    (event) =>
+      (event.metadata as Record<string, unknown> | undefined)?.trace_kind ===
+      "call_status",
   );
-  assert.ok(statuses.length > 0, "the fixture should contain call_status events");
+  assert.ok(
+    statuses.length > 0,
+    "the fixture should contain call_status events",
+  );
   assert.equal(getLatestToolProgress(statuses), "");
 });

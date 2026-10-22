@@ -2,7 +2,11 @@
 
 import { useTranslation } from "react-i18next";
 
-import { brandIconFor, brandInitials, type BrandNamespace } from "@/lib/brand-icons";
+import {
+  brandIconFor,
+  brandInitials,
+  type BrandNamespace,
+} from "@/lib/brand-icons";
 
 /**
  * The square mark in front of a store entry: the product's own logo when we have
@@ -41,7 +45,6 @@ export default function BrandIcon({
       // The name is already adjacent in every current caller, so the mark is
       // decorative and announcing it again would just double every row.
       aria-hidden
-      title={icon ? icon.title : name}
       className={`flex shrink-0 items-center justify-center rounded-lg border border-[var(--border)]/60 bg-[var(--background)] font-semibold tracking-tight text-[var(--muted-foreground)] ${box} ${className}`}
     >
       {icon ? (
@@ -71,7 +74,9 @@ export default function BrandIcon({
 export function TrademarkNote({ className = "" }: { className?: string }) {
   const { t } = useTranslation();
   return (
-    <p className={`text-[11px] leading-relaxed text-[var(--muted-foreground)]/70 ${className}`}>
+    <p
+      className={`text-[11px] leading-relaxed text-[var(--muted-foreground)]/70 ${className}`}
+    >
       {t(
         "Product names and logos are trademarks of their respective owners, shown for identification only.",
       )}
